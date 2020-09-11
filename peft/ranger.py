@@ -44,21 +44,21 @@ C0 = np.array([
     [1, 1, 0]
 ])
 
-def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, proc_schedules=None, time_offset=0, relabel_nodes=True):
+def schedule_dag(dag, computation_matrix=W0, communication_overhead=1, proc_schedules=None, relabel_nodes=True):
     """
     Given an application DAG and a set of matrices specifying PE bandwidth and (task, pe) execution times, computes the HEFT schedule
-    of that DAG onto that set of PEs 
+    of that DAG onto that set of PEs
     """
     if proc_schedules == None:
         proc_schedules = {}
 
     _self = {
         'computation_matrix': computation_matrix,
-        'communication_matrix': communication_matrix,
+        'communication_overhead': communication_overhead,
         'task_schedules': {},
         'proc_schedules': proc_schedules,
         'numExistingJobs': 0,
-        'time_offset': time_offset,
+        'time_offset': communication_overhead,
         'root_node': None,
         'optimistic_cost_table': None
     }
@@ -76,7 +76,7 @@ def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, proc_sched
     # Setup arrays to hold the task and proc schedules.
     for i in range(_self.numExistingJobs + len(_self.computation_matrix)):
         _self.task_schedules[i] = None
-    for i in range(len(_self.communication_matrix)):
+    for i in range(_self.computation_matrix.shape[1]):
         if i not in _self.proc_schedules:
             _self.proc_schedules[i] = []
 
@@ -85,7 +85,7 @@ def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, proc_sched
         for schedule_event in proc_schedules[proc]:
             _self.task_schedules[schedule_event.task] = schedule_event
 
-    # Nodes with no successors cause the any expression to be empty    
+    # Nodes with no successors cause the any expression to be empty
     root_node = [node for node in dag.nodes() if not any(True for _ in dag.predecessors(node))]
     assert len(root_node) == 1, f"Expected a single root node, found {len(root_node)}"
     root_node = root_node[0]
@@ -106,7 +106,7 @@ def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, proc_sched
             continue
         minTaskSchedule = ScheduleEvent(node, inf, inf, -1)
         minOptimisticCost = inf
-        for proc in range(len(communication_matrix)):
+        for proc in range(_self.computation_matrix.shape[1]):
             taskschedule = _compute_eft(_self, dag, node, proc)
             if (taskschedule.end + _self.optimistic_cost_table[node][proc] < minTaskSchedule.end + minOptimisticCost):
                 minTaskSchedule = taskschedule
@@ -126,7 +126,7 @@ def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, proc_sched
                 second_job = _self.proc_schedules[proc][job+1]
                 assert first_job.end <= second_job.start, \
                 f"Jobs on a particular processor must finish before the next can begin, but job {first_job.task} on processor {first_job.proc} ends at {first_job.end} and its successor {second_job.task} starts at {second_job.start}"
-    
+
     dict_output = {}
     for proc_num, proc_tasks in _self.proc_schedules.items():
         for idx, task in enumerate(proc_tasks):
@@ -136,7 +136,7 @@ def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, proc_sched
                 dict_output[task.task] = (proc_num, idx, [])
 
     return _self.proc_schedules, _self.task_schedules, dict_output
-    
+
 def _compute_optimistic_cost_table(_self, dag):
     """
     Uses a basic BFS approach to traverse upwards through the graph building the optimistic cost table along the way
@@ -147,20 +147,15 @@ def _compute_optimistic_cost_table(_self, dag):
     terminal_node = [node for node in dag.nodes() if not any(True for _ in dag.successors(node))]
     assert len(terminal_node) == 1, f"Expected a single terminal node, found {len(terminal_node)}"
     terminal_node = terminal_node[0]
-  
-    # Here is where the self connections are zeroed out.
-    diagonal_mask = np.ones(_self.communication_matrix.shape, dtype=bool)
-    # We not longer want to zero out self connections in RANGER.
-    # np.fill_diagonal(diagonal_mask, 0)
-    avgCommunicationCost = np.mean(_self.communication_matrix[diagonal_mask])
+
     for edge in dag.edges():
-        logger.debug(f"Assigning {edge}'s average weight based on average communication cost. {float(dag.get_edge_data(*edge)['weight'])} => {float(dag.get_edge_data(*edge)['weight']) / avgCommunicationCost}")
-        nx.set_edge_attributes(dag, { edge: float(dag.get_edge_data(*edge)['weight']) / avgCommunicationCost }, 'avgweight')
+        logger.debug(f"Assigning {edge}'s based on communication overhead. {_self.communication_overhead}")
+        nx.set_edge_attributes(dag, { edge: _self.communication_overhead }, 'avgweight')
 
     optimistic_cost_table[terminal_node] = _self.computation_matrix.shape[1] * [0]
     dag.node[terminal_node]['rank'] = 0
     visit_queue = deque(dag.predecessors(terminal_node))
-    
+
     node_can_be_processed = lambda node: all(successor in optimistic_cost_table for successor in dag.successors(node))
     while visit_queue:
         node = visit_queue.pop()
@@ -173,7 +168,7 @@ def _compute_optimistic_cost_table(_self, dag):
                 raise RuntimeError(f"Node {node} cannot be processed, and there are no other nodes in the queue to process instead!")
             visit_queue.appendleft(node)
             node = node2
-        
+
         logger.debug(f"Computing optimistic cost table entries for node: {node}")
 
         # Perform OCT kernel
@@ -203,7 +198,7 @@ def _compute_optimistic_cost_table(_self, dag):
 
     return optimistic_cost_table
 
-def _compute_eft(_self, dag, node, proc, communication_overhead = 3):
+def _compute_eft(_self, dag, node, proc):
     """
     Computes the EFT of a particular node if it were scheduled on a particular processor
     It does this by first looking at all predecessor tasks of a particular node and determining the earliest time a task would be ready for execution (ready_time)
@@ -215,10 +210,10 @@ def _compute_eft(_self, dag, node, proc, communication_overhead = 3):
         predjob = _self.task_schedules[prednode]
         assert predjob != None, f"Predecessor nodes must be scheduled before their children, but node {node} has an unscheduled predecessor of {prednode}"
         logger.debug(f"\tLooking at predecessor node {prednode} with job {predjob} to determine ready time")
-        if _self.communication_matrix[predjob.proc, proc] == 0:
+        if _self.communication_overhead == 0:
             ready_time_t = predjob.end
         else:
-            ready_time_t = predjob.end + dag[predjob.task][node]['weight'] / _self.communication_matrix[predjob.proc, proc]
+            ready_time_t = predjob.end + _self.communication_overhead
         logger.debug(f"\tNode {prednode} can have its data routed to processor {proc} by time {ready_time_t}")
         if ready_time_t > ready_time:
             ready_time = ready_time_t
@@ -229,13 +224,13 @@ def _compute_eft(_self, dag, node, proc, communication_overhead = 3):
     for idx in range(len(job_list)):
         prev_job = job_list[idx]
         if idx == 0:
-            if (prev_job.start - computation_time) - ready_time - (2 * communication_overhead) > 0:
+            if (prev_job.start - computation_time) - ready_time - (2 * _self.communication_overhead) > 0:
                 logger.debug(f"Found an insertion slot before the first job {prev_job} on processor {proc}")
-                job_start = ready_time + communication_overhead
+                job_start = ready_time + _self.communication_overhead
                 min_schedule = ScheduleEvent(node, job_start, job_start+computation_time, proc)
                 break
         if idx == len(job_list)-1:
-            job_start = max(ready_time, prev_job.end + communication_overhead)  # Need 3 cycle communication gap between tasks running on a processor
+            job_start = max(ready_time, prev_job.end + _self.communication_overhead)  # Need 3 cycle communication gap between tasks running on a processor
             min_schedule = ScheduleEvent(node, job_start, job_start + computation_time, proc)
             break
         next_job = job_list[idx+1]
@@ -252,11 +247,11 @@ def _compute_eft(_self, dag, node, proc, communication_overhead = 3):
         #For-else loop: the else executes if the for loop exits without break-ing, which in this case means the number of jobs on this processor are 0
         min_schedule = ScheduleEvent(node, ready_time, ready_time + computation_time, proc)
     logger.debug(f"\tFor node {node} on processor {proc}, the EFT is {min_schedule}")
-    return min_schedule    
+    return min_schedule
 
 def readCsvToNumpyMatrix(csv_file):
     """
-    Given an input file consisting of a comma separated list of numeric values with a single header row and header column, 
+    Given an input file consisting of a comma separated list of numeric values with a single header row and header column,
     this function reads that data into a numpy matrix and strips the top row and leftmost column
     """
     with open(csv_file) as fd:
@@ -265,7 +260,7 @@ def readCsvToNumpyMatrix(csv_file):
         contentsList = contents.split('\n')
         contentsList = list(map(lambda line: line.split(','), contentsList))
         contentsList = contentsList[0:len(contentsList)-1] if contentsList[len(contentsList)-1] == [''] else contentsList
-        
+
         matrix = np.array(contentsList)
         matrix = np.delete(matrix, 0, 0) # delete the first row (entry 0 along axis 0)
         matrix = np.delete(matrix, 0, 1) # delete the first column (entry 0 along axis 1)
@@ -275,12 +270,12 @@ def readCsvToNumpyMatrix(csv_file):
 
 def readCsvToDict(csv_file):
     """
-    Given an input file consisting of a comma separated list of numeric values with a single header row and header column, 
+    Given an input file consisting of a comma separated list of numeric values with a single header row and header column,
     this function reads that data into a dictionary with keys that are node numbers and values that are the CSV lists
     """
     with open(csv_file) as fd:
         matrix = readCsvToNumpyMatrix(csv_file)
-        
+
         outputDict = {}
         for row_num, row in enumerate(matrix):
             outputDict[row_num] = row
@@ -306,23 +301,26 @@ def readDagMatrix(dag_file, show_dag=False):
 
 def generate_argparser():
     parser = argparse.ArgumentParser(description="A tool for finding PEFT schedules for given DAG task graphs")
-    parser.add_argument("-d", "--dag_file", 
+    parser.add_argument("-d", "--dag_file",
                         help="File containing input DAG to be scheduled. Uses default 10 node dag from Arabnejad 2014 if none given.",
                         type=str, default="test/peftgraph_task_connectivity.csv")
-    parser.add_argument("-p", "--pe_connectivity_file", 
-                        help="File containing connectivity/bandwidth information about PEs. Uses a default 3x3 matrix from Arabnejad 2014 if none given.",
-                        type=str, default="test/peftgraph_resource_BW.csv")
-    parser.add_argument("-t", "--task_execution_file", 
+    parser.add_argument("-c", "--communication_delay",
+                        help="Value for communication latency",
+                        type=int, default="1")
+    parser.add_argument("-s", "--streaming_overhead",
+                        help="Value for streaming overhead added to processor exe time",
+                        type=int, default="3")
+    parser.add_argument("-t", "--task_execution_file",
                         help="File containing execution times of each task on each particular PE. Uses a default 10x3 matrix from Arabnejad 2014 if none given.",
                         type=str, default="test/peftgraph_task_exe_time.csv")
-    parser.add_argument("-l", "--loglevel", 
-                        help="The log level to be used in this module. Default: INFO", 
+    parser.add_argument("-l", "--loglevel",
+                        help="The log level to be used in this module. Default: INFO",
                         type=str, default="INFO", dest="loglevel", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
-    parser.add_argument("--showDAG", 
-                        help="Switch used to enable display of the incoming task DAG", 
+    parser.add_argument("--showDAG",
+                        help="Switch used to enable display of the incoming task DAG",
                         dest="showDAG", action="store_true")
-    parser.add_argument("--showGantt", 
-                        help="Switch used to enable display of the final scheduled Gantt chart", 
+    parser.add_argument("--showGantt",
+                        help="Switch used to enable display of the final scheduled Gantt chart",
                         dest="showGantt", action="store_true")
     return parser
 
@@ -336,11 +334,14 @@ if __name__ == "__main__":
     consolehandler.setFormatter(logging.Formatter("%(levelname)8s : %(name)16s : %(message)s"))
     logger.addHandler(consolehandler)
 
-    communication_matrix = readCsvToNumpyMatrix(args.pe_connectivity_file)
     computation_matrix = readCsvToNumpyMatrix(args.task_execution_file)
-    dag = readDagMatrix(args.dag_file, args.showDAG) 
 
-    processor_schedules, _, _ = schedule_dag(dag, communication_matrix=communication_matrix, computation_matrix=computation_matrix)
+    # Add the streaming overhead to the computation.
+    computation_matrix = np.add(computation_matrix, args.streaming_overhead)
+
+    dag = readDagMatrix(args.dag_file, args.showDAG)
+
+    processor_schedules, _, _ = schedule_dag(dag, communication_overhead=args.communication_delay, computation_matrix=computation_matrix)
     for proc, jobs in processor_schedules.items():
         logger.info(f"Processor {proc} has the following jobs:")
         logger.info(f"\t{jobs}")
