@@ -17,16 +17,24 @@ def convert_dep(filename, weight):
         line = line.strip()
         layer, depends = line.split(':')
         d = depends.split(',')
-        dep_map[layer] = d
+        dep_map[layer] = [i.strip() for i in d]
 
-    keys = dep_map.keys()
+    # Reverse the map from a backwards dependency map to a forwards DAG graph.
+    w_map = OrderedDict()
+    for k in dep_map.keys():
+        w_map[k] = []
+        for i, v in dep_map.items():
+            if k in v:
+                w_map[k].append(i)
+
+    keys = w_map.keys()
     csv_filename = os.path.splitext(filename)[0]+'_task_connectivity.csv'
     with open(csv_filename, 'w', newline='') as csvfile:
         fieldnames = ['T'] + list(keys)
         writer = csv.DictWriter(csvfile, fieldnames, restval='0')
         writer.writeheader()
 
-        for key, value in dep_map.items():
+        for key, value in w_map.items():
             d = {v.strip():weight for v in value if v.strip()}
             print(d)
             d['T'] = key

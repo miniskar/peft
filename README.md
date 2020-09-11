@@ -68,5 +68,9 @@ With a generated Gantt chart available using
 Example usage as an external library is given by [this notebook](https://github.com/mackncheesiest/peft/blob/master/jupyter/PEFT_Example.ipynb)
 -->
 
+## RANGER
+The RANGER architecture can be run with:
+`python -m peft.ranger -d test/peftgraph_task_connectivity.csv -t test/peftgraph_task_exe_time.csv -c 0 -s 3 --showGantt`
+
 ## Testing
 If Pytest is installed, tests can be executed simply by running `pytest` from the repository root directory
