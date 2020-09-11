@@ -73,12 +73,14 @@ def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, proc_sched
         #Negates any offsets that would have been needed had the jobs been relabeled
         _self.numExistingJobs = 0
 
+    # Setup arrays to hold the task and proc schedules.
     for i in range(_self.numExistingJobs + len(_self.computation_matrix)):
         _self.task_schedules[i] = None
     for i in range(len(_self.communication_matrix)):
         if i not in _self.proc_schedules:
             _self.proc_schedules[i] = []
 
+    # Reapply existing schedules
     for proc in proc_schedules:
         for schedule_event in proc_schedules[proc]:
             _self.task_schedules[schedule_event.task] = schedule_event
@@ -145,9 +147,11 @@ def _compute_optimistic_cost_table(_self, dag):
     terminal_node = [node for node in dag.nodes() if not any(True for _ in dag.successors(node))]
     assert len(terminal_node) == 1, f"Expected a single terminal node, found {len(terminal_node)}"
     terminal_node = terminal_node[0]
-
+  
+    # Here is where the self connections are zeroed out.
     diagonal_mask = np.ones(_self.communication_matrix.shape, dtype=bool)
-    np.fill_diagonal(diagonal_mask, 0)
+    # We not longer want to zero out self connections in RANGER.
+    # np.fill_diagonal(diagonal_mask, 0)
     avgCommunicationCost = np.mean(_self.communication_matrix[diagonal_mask])
     for edge in dag.edges():
         logger.debug(f"Assigning {edge}'s average weight based on average communication cost. {float(dag.get_edge_data(*edge)['weight'])} => {float(dag.get_edge_data(*edge)['weight']) / avgCommunicationCost}")
@@ -184,7 +188,7 @@ def _compute_optimistic_cost_table(_self, dag):
                 for succ_proc in range(_self.computation_matrix.shape[1]):
                     successor_oct = optimistic_cost_table[succnode][succ_proc]
                     successor_comp_cost = _self.computation_matrix[succnode][succ_proc]
-                    successor_comm_cost = dag[node][succnode]['avgweight'] if curr_proc != succ_proc else 0
+                    successor_comm_cost = dag[node][succnode]['avgweight'] # if curr_proc != succ_proc else 0 # In RANGER there is comm cost for the same proc.
                     cost = successor_oct + successor_comp_cost + successor_comm_cost
                     logger.debug(f"If node {node} is on {curr_proc} and successor {succnode} is on {succ_proc}, the optimistic cost entry is {cost}")
                     if cost < min_proc_oct:
@@ -199,7 +203,7 @@ def _compute_optimistic_cost_table(_self, dag):
 
     return optimistic_cost_table
 
-def _compute_eft(_self, dag, node, proc):
+def _compute_eft(_self, dag, node, proc, communication_overhead = 3):
     """
     Computes the EFT of a particular node if it were scheduled on a particular processor
     It does this by first looking at all predecessor tasks of a particular node and determining the earliest time a task would be ready for execution (ready_time)
@@ -225,13 +229,13 @@ def _compute_eft(_self, dag, node, proc):
     for idx in range(len(job_list)):
         prev_job = job_list[idx]
         if idx == 0:
-            if (prev_job.start - computation_time) - ready_time > 0:
+            if (prev_job.start - computation_time) - ready_time - (2 * communication_overhead) > 0:
                 logger.debug(f"Found an insertion slot before the first job {prev_job} on processor {proc}")
-                job_start = ready_time
+                job_start = ready_time + communication_overhead
                 min_schedule = ScheduleEvent(node, job_start, job_start+computation_time, proc)
                 break
         if idx == len(job_list)-1:
-            job_start = max(ready_time, prev_job.end)
+            job_start = max(ready_time, prev_job.end + communication_overhead)  # Need 3 cycle communication gap between tasks running on a processor
             min_schedule = ScheduleEvent(node, job_start, job_start + computation_time, proc)
             break
         next_job = job_list[idx+1]
