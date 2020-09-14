@@ -73,12 +73,14 @@ def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, proc_sched
         #Negates any offsets that would have been needed had the jobs been relabeled
         _self.numExistingJobs = 0
 
+    # Setup arrays to hold the task and proc schedules.
     for i in range(_self.numExistingJobs + len(_self.computation_matrix)):
         _self.task_schedules[i] = None
     for i in range(len(_self.communication_matrix)):
         if i not in _self.proc_schedules:
             _self.proc_schedules[i] = []
 
+    # Reapply existing schedules
     for proc in proc_schedules:
         for schedule_event in proc_schedules[proc]:
             _self.task_schedules[schedule_event.task] = schedule_event
@@ -270,6 +272,27 @@ def readCsvToNumpyMatrix(csv_file):
         logger.debug(f"After deleting the first row and column of input data, we are left with this matrix:\n{matrix}")
         return matrix
 
+def getTaskAndAcclNames(csv_file):
+    """
+    Given an input file consisting of a comma separated list of numeric values with a single header row and header column,
+    this function returns the names of the tasks and the accelerators.
+    """
+    with open(csv_file) as fd:
+        lines = fd.readlines()
+
+    accls = []
+    line = lines.pop(0).split(',')
+    for i, a in enumerate(line):
+        if i == 0:
+            continue
+        accls.append(a.strip())
+
+    tasks = []
+    for line in lines:
+        tasks.append(line.split(',')[0].strip())
+
+    return tasks, accls
+
 def readCsvToDict(csv_file):
     """
     Given an input file consisting of a comma separated list of numeric values with a single header row and header column,
@@ -321,6 +344,9 @@ def generate_argparser():
     parser.add_argument("--showGantt",
                         help="Switch used to enable display of the final scheduled Gantt chart",
                         dest="showGantt", action="store_true")
+    parser.add_argument("-o", "--output",
+                        help="Output format to use for results",
+                        choices=['default', 'task'], default='default')
     return parser
 
 if __name__ == "__main__":
@@ -337,9 +363,17 @@ if __name__ == "__main__":
     computation_matrix = readCsvToNumpyMatrix(args.task_execution_file)
     dag = readDagMatrix(args.dag_file, args.showDAG)
 
-    processor_schedules, _, _ = schedule_dag(dag, communication_matrix=communication_matrix, computation_matrix=computation_matrix)
-    for proc, jobs in processor_schedules.items():
-        logger.info(f"Processor {proc} has the following jobs:")
-        logger.info(f"\t{jobs}")
+    processor_schedules, task_schedules, dict_output = schedule_dag(dag, communication_matrix=communication_matrix, computation_matrix=computation_matrix)
+
+    if args.output == 'default':
+        for proc, jobs in processor_schedules.items():
+            logger.info(f"Processor {proc} has the following jobs:")
+            logger.info(f"\t{jobs}")
+    else: # task
+        print(f"taskname,start,end,duration,acclname")
+        tasks, accls = getTaskAndAcclNames(args.task_execution_file)
+        for i, task in task_schedules.items():
+            print(f"{tasks[i]},{task.start},{task.end},{task.end-task.start},{accls[task.proc]}")
+
     if args.showGantt:
         showGanttChart(processor_schedules)
