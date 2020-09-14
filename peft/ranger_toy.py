@@ -44,7 +44,7 @@ C0 = np.array([
     [1, 1, 0]
 ])
 
-def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, proc_schedules=None, time_offset=0, relabel_nodes=True):
+def schedule_dag(dag, computation_matrix=W0, communication_overhead=1, proc_schedules=None, relabel_nodes=True):
     """
     Given an application DAG and a set of matrices specifying PE bandwidth and (task, pe) execution times, computes the HEFT schedule
     of that DAG onto that set of PEs
@@ -54,11 +54,11 @@ def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, proc_sched
 
     _self = {
         'computation_matrix': computation_matrix,
-        'communication_matrix': communication_matrix,
+        'communication_overhead': communication_overhead,
         'task_schedules': {},
         'proc_schedules': proc_schedules,
         'numExistingJobs': 0,
-        'time_offset': time_offset,
+        'time_offset': communication_overhead,
         'root_node': None,
         'optimistic_cost_table': None
     }
@@ -76,7 +76,7 @@ def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, proc_sched
     # Setup arrays to hold the task and proc schedules.
     for i in range(_self.numExistingJobs + len(_self.computation_matrix)):
         _self.task_schedules[i] = None
-    for i in range(len(_self.communication_matrix)):
+    for i in range(_self.computation_matrix.shape[1]):
         if i not in _self.proc_schedules:
             _self.proc_schedules[i] = []
 
@@ -106,7 +106,7 @@ def schedule_dag(dag, computation_matrix=W0, communication_matrix=C0, proc_sched
             continue
         minTaskSchedule = ScheduleEvent(node, inf, inf, -1)
         minOptimisticCost = inf
-        for proc in range(len(communication_matrix)):
+        for proc in range(_self.computation_matrix.shape[1]):
             taskschedule = _compute_eft(_self, dag, node, proc)
             if (taskschedule.end + _self.optimistic_cost_table[node][proc] < minTaskSchedule.end + minOptimisticCost):
                 minTaskSchedule = taskschedule
@@ -148,12 +148,9 @@ def _compute_optimistic_cost_table(_self, dag):
     assert len(terminal_node) == 1, f"Expected a single terminal node, found {len(terminal_node)}"
     terminal_node = terminal_node[0]
 
-    diagonal_mask = np.ones(_self.communication_matrix.shape, dtype=bool)
-    # np.fill_diagonal(diagonal_mask, 0)
-    avgCommunicationCost = np.mean(_self.communication_matrix[diagonal_mask])
     for edge in dag.edges():
-        logger.debug(f"Assigning {edge}'s average weight based on average communication cost. {float(dag.get_edge_data(*edge)['weight'])} => {float(dag.get_edge_data(*edge)['weight']) / avgCommunicationCost}")
-        nx.set_edge_attributes(dag, { edge: float(dag.get_edge_data(*edge)['weight']) / avgCommunicationCost }, 'avgweight')
+        logger.debug(f"Assigning {edge}'s based on communication overhead. {_self.communication_overhead}")
+        nx.set_edge_attributes(dag, { edge: _self.communication_overhead }, 'avgweight')
 
     optimistic_cost_table[terminal_node] = _self.computation_matrix.shape[1] * [0]
     dag.node[terminal_node]['rank'] = 0
@@ -209,22 +206,18 @@ def _compute_eft(_self, dag, node, proc):
     It then looks at the list of tasks scheduled on this particular processor and determines the earliest time (after ready_time) a given node can be inserted into this processor's queue
     """
     ready_time = _self.time_offset
-    communication_overhead = 0
     logger.debug(f"Computing EFT for node {node} on processor {proc}")
     for prednode in list(dag.predecessors(node)):
         predjob = _self.task_schedules[prednode]
         assert predjob != None, f"Predecessor nodes must be scheduled before their children, but node {node} has an unscheduled predecessor of {prednode}"
         logger.debug(f"\tLooking at predecessor node {prednode} with job {predjob} to determine ready time")
-        if _self.communication_matrix[predjob.proc, proc] == 0:
+        if _self.communication_overhead == 0:
             ready_time_t = predjob.end
-            communication_overhead_t = 0
         else:
-            ready_time_t = predjob.end + dag[predjob.task][node]['weight'] / _self.communication_matrix[predjob.proc, proc]
-            communication_overhead_t = dag[predjob.task][node]['weight'] / _self.communication_matrix[predjob.proc, proc]
+            ready_time_t = predjob.end + _self.communication_overhead
         logger.debug(f"\tNode {prednode} can have its data routed to processor {proc} by time {ready_time_t}")
         if ready_time_t > ready_time:
             ready_time = ready_time_t
-            communication_overhead = communication_overhead_t
     logger.debug(f"\tReady time determined to be {ready_time}")
 
     computation_time = _self.computation_matrix[node-_self.numExistingJobs, proc]
@@ -232,13 +225,13 @@ def _compute_eft(_self, dag, node, proc):
     for idx in range(len(job_list)):
         prev_job = job_list[idx]
         if idx == 0:
-            if (prev_job.start - computation_time) - ready_time - (2 * communication_overhead) > 0:
+            if (prev_job.start - computation_time) - ready_time - (2 * _self.communication_overhead) > 0:
                 logger.debug(f"Found an insertion slot before the first job {prev_job} on processor {proc}")
-                job_start = ready_time + communication_overhead
+                job_start = ready_time + _self.communication_overhead
                 min_schedule = ScheduleEvent(node, job_start, job_start+computation_time, proc)
                 break
         if idx == len(job_list)-1:
-            job_start = max(ready_time, prev_job.end + communication_overhead)  # Need 3 cycle communication gap between tasks running on a processor
+            job_start = max(ready_time, prev_job.end + _self.communication_overhead)  # Need 3 cycle communication gap between tasks running on a processor
             min_schedule = ScheduleEvent(node, job_start, job_start + computation_time, proc)
             break
         next_job = job_list[idx+1]
@@ -312,6 +305,12 @@ def generate_argparser():
     parser.add_argument("-d", "--dag_file",
                         help="File containing input DAG to be scheduled. Uses default 10 node dag from Arabnejad 2014 if none given.",
                         type=str, default="test/peftgraph_task_connectivity.csv")
+    parser.add_argument("-c", "--communication_delay",
+                        help="Value for communication latency",
+                        type=int, default="1")
+    parser.add_argument("-s", "--streaming_overhead",
+                        help="Value for streaming overhead added to processor exe time",
+                        type=int, default="3")
     parser.add_argument("-t", "--task_execution_file",
                         help="File containing execution times of each task on each particular PE. Uses a default 10x3 matrix from Arabnejad 2014 if none given.",
                         type=str, default="test/peftgraph_task_exe_time.csv")
@@ -337,10 +336,13 @@ if __name__ == "__main__":
     logger.addHandler(consolehandler)
 
     computation_matrix = readCsvToNumpyMatrix(args.task_execution_file)
-    communication_matrix = np.ones((computation_matrix.shape[1], computation_matrix.shape[1]))
+
+    # Add the streaming overhead to the computation.
+    computation_matrix = np.add(computation_matrix, args.streaming_overhead)
+
     dag = readDagMatrix(args.dag_file, args.showDAG)
 
-    processor_schedules, _, _ = schedule_dag(dag, communication_matrix=communication_matrix, computation_matrix=computation_matrix)
+    processor_schedules, _, _ = schedule_dag(dag, communication_overhead=args.communication_delay, computation_matrix=computation_matrix)
     for proc, jobs in processor_schedules.items():
         logger.info(f"Processor {proc} has the following jobs:")
         logger.info(f"\t{jobs}")
